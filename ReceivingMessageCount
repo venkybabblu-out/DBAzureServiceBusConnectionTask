@@ -1,0 +1,21 @@
+from azure.servicebus import ServiceBusClient
+
+# Replace with your actual values
+connection_string = dbutils.secrets.get(scope=secret_scope, key="LVT-DEX-SB-CONN-STR")
+TOPIC_NAME = "lvt-dex-intergration-tst-exportpotential"
+SUBSCRIPTION_NAME = "ExportPotential"
+
+# Create a Service Bus client
+with ServiceBusClient.from_connection_string(conn_str=connection_string) as client:
+    # Get a receiver for the subscription
+    with client.get_subscription_receiver(
+        topic_name=TOPIC_NAME,
+        subscription_name=SUBSCRIPTION_NAME
+    ) as receiver:
+
+        # Receive messages
+        for msg in receiver.receive_messages(max_message_count=10, max_wait_time=5):
+            print("Received:", str(msg))
+            
+            # Complete the message so it's removed from the subscription
+            receiver.complete_message(msg)
