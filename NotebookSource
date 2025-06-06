@@ -1,0 +1,576 @@
+# Databricks notebook source
+# MAGIC %pip install azure-servicebus
+
+# COMMAND ----------
+
+# MAGIC %restart_python
+
+# COMMAND ----------
+
+from azure.servicebus import ServiceBusClient, ServiceBusMessage
+import json
+from pyspark.sql.types import StructType, StructField, StringType
+from pyspark.sql.functions import (
+    lit,
+    current_timestamp,
+    col,
+    get_json_object,
+    regexp_replace,
+    split,
+    sha2,
+    lit,
+    concat_ws,
+    current_timestamp,
+    col,
+    when,
+    size,
+)
+import time
+from delta.tables import *
+
+# COMMAND ----------
+
+dbutils.widgets.text("secret_scope", "orlkvtst")
+dbutils.widgets.text("queue_name", "lvt-dex-intergration-tst-exportpotential")
+dbutils.widgets.text("ucName", "res_team_orl_uc_tst")
+dbutils.widgets.text("logSchemaName", "logging_info")
+dbutils.widgets.text("batchSize", "100000")
+
+# COMMAND ----------
+
+secret_scope = dbutils.widgets.get("secret_scope")
+queue_name = dbutils.widgets.get("queue_name")
+ucName = dbutils.widgets.get("ucName")
+logSchemaName = dbutils.widgets.get("logSchemaName")
+batch_size = int(dbutils.widgets.get("batchSize"))
+
+# COMMAND ----------
+
+connection_string = dbutils.secrets.get(scope=secret_scope, key="LVT-DEX-SB-CONN-STR")
+schema = StructType([StructField("json_msg", StringType(), True)])
+
+# COMMAND ----------
+
+
+def read_messages_from_service_bus(CONNECTION_STR, QUEUE_NAME, batch_size):
+    """
+    Reads messages from an Azure Service Bus queue in batches.
+
+    This function establishes a connection to the Azure Service Bus queue,
+    retrieves messages in batches, decodes them from JSON, and marks them
+    as completed once processed. It stops fetching messages when no more
+    messages are available or when the batch size limit is reached.
+
+    Parameters:
+    - CONNECTION_STR (str): Connection string for the Azure Service Bus.
+    - QUEUE_NAME (str): Name of the Service Bus queue.
+    - batch_size (int): Maximum number of messages to retrieve.
+
+    Returns:
+    - list: A list containing the decoded messages.
+    """
+
+    try:
+        # Create a Service Bus client using the provided connection string
+        with ServiceBusClient.from_connection_string(CONNECTION_STR) as client:
+            # Get the queue receiver with a wait time and prefetch count for efficiency
+            with client.get_queue_receiver(
+                queue_name=QUEUE_NAME, max_wait_time=15, prefetch_count=1000
+            ) as receiver:
+                msg_list = []
+                i = 0
+                start_time = time.time()
+                nullCount = 0
+                while True:
+                    # Fetch messages in a batch from the queue
+                    messages = receiver.receive_messages(max_message_count=1000)
+                    print(f"got batch messages {len(messages)}")
+
+                    # Stop if no messages are left
+                    if not messages:
+                        if nullCount == 0:
+                            nullCount = 1
+                            continue
+                        else:
+                            break
+
+                    # Process each received message
+                    for message in messages:
+                        try:
+                            # Decode and parse the message body from JSON format
+                            msg = json.loads(b"".join(message.body).decode("utf-8"))
+                            msg_list.append(msg)
+                            # print(f"Received a message!")
+                        except json.JSONDecodeError:
+                            print(f"Invalid JSON: {message.body}")
+
+                        # Mark message as completed
+                        # print(f"complete!")
+                        receiver.complete_message(message)
+
+                    i = i + len(messages)
+                    # Stop processing if batch size limit is reached
+                    if i > batch_size:
+                        print(f"Reached {i} messages!")
+                        break
+
+                print(
+                    f"Completed reading {i} messages in {time.time() - start_time} seconds."
+                )
+                return msg_list
+    except Exception as e:
+        print(f"Error occurred: {e}")
+
+
+# COMMAND ----------
+
+"""
+Continuously read messages from the Azure Service Bus queue and process them.
+If no messages are found, the script waits for 60 seconds before retrying.
+"""
+while True:
+    # Read messages from the Service Bus
+    messages = read_messages_from_service_bus(connection_string, queue_name, batch_size)
+    print(messages)
+
+    # If no messages are received, wait for 60 seconds before retrying
+    # if len(messages) == 0 or messages is None:
+    #     print("No messages found. Pausing of 60 seconds...")
+    #     time.sleep(60)
+    #     continue
+
+    # Convert messages into tuples for DataFrame creation
+    data_tuples = [(message,) for message in messages]
+    print(data_tuples)
+    # Create a Spark DataFrame and add necessary columns
+    # messages_sdf = (
+    #     spark.createDataFrame(data_tuples, schema)
+    #     .withColumn("isProccessed", lit(0))
+    #     .withColumn("blobUrl", get_json_object(col("json_msg"), "$.data.blobUrl"))
+    #     .withColumn(
+    #         "dbfsUrl",
+    #         regexp_replace(
+    #             col("blobUrl"),
+    #             "https://prodrenewablesadlsgen2.blob.core.windows.net/nrt/",
+    #             "dbfs:/mnt/ot/",
+    #         ),
+    #     )
+    #     .withColumn("eventTime", get_json_object(col("json_msg"), "$.eventTime"))
+    #     .withColumn("insertedTimestampUtc", current_timestamp())
+    #     .withColumn("processedTimestampUtc", current_timestamp())
+    # )
+
+    # # Filter messages to include only those with specific blob storage URLs
+    # filtered_sdf = messages_sdf.filter(
+    #     col("blobUrl").contains(
+    #         "https://prodrenewablesadlsgen2.blob.core.windows.net/nrt/EDGE2CLOUD/DATA/ARCHIVAL/STANDARD"
+    #     )
+    # ).dropDuplicates(["blobUrl", "eventTime"])
+
+    # # Append the processed messages into a Delta table for storage
+    # filtered_sdf.write.format("delta").mode("append").saveAsTable(
+    #     f"{ucName}.{logSchemaName}.nrt_service_bus_messages"
+    # )
+
+    # # SQL query to remove duplicate records based on blobUrl and eventTime
+    # query = f"""
+    #     MERGE INTO {ucName}.{logSchemaName}.nrt_service_bus_messages AS target
+    #     USING (
+    #         SELECT blobUrl, eventTime FROM (
+    #             SELECT 
+    #                 blobUrl,
+    #                 eventTime, 
+    #                 ROW_NUMBER() OVER (PARTITION BY blobUrl, eventTime ORDER BY (insertedTimestampUtc)) AS rn
+    #             FROM {ucName}.{logSchemaName}.nrt_service_bus_messages
+    #         ) WHERE rn > 1 
+    #     ) AS source
+    #     ON target.blobUrl = source.blobUrl AND target.eventTime = source.eventTime
+    #     WHEN MATCHED THEN DELETE;
+    #     """
+
+    # # Execute the merge query to remove duplicate
+    # spark.sql(query)
+    # Databricks notebook source
+# MAGIC %pip install azure-servicebus
+
+# COMMAND ----------
+
+# MAGIC %restart_python
+
+# COMMAND ----------
+
+from azure.servicebus import ServiceBusClient, ServiceBusMessage
+import json
+from pyspark.sql.types import StructType, StructField, StringType
+from pyspark.sql.functions import (
+    lit,
+    current_timestamp,
+    col,
+    get_json_object,
+    regexp_replace,
+    split,
+    sha2,
+    lit,
+    concat_ws,
+    current_timestamp,
+    col,
+    when,
+    size,
+)
+import time
+from delta.tables import *
+
+# COMMAND ----------
+
+dbutils.widgets.text("secret_scope", "orlkvtst")
+dbutils.widgets.text("queue_name", "lvt-dex-intergration-tst-exportpotential")
+dbutils.widgets.text("ucName", "res_team_orl_uc_tst")
+dbutils.widgets.text("logSchemaName", "logging_info")
+dbutils.widgets.text("batchSize", "100000")
+
+# COMMAND ----------
+
+secret_scope = dbutils.widgets.get("secret_scope")
+queue_name = dbutils.widgets.get("queue_name")
+ucName = dbutils.widgets.get("ucName")
+logSchemaName = dbutils.widgets.get("logSchemaName")
+batch_size = int(dbutils.widgets.get("batchSize"))
+
+# COMMAND ----------
+
+connection_string = dbutils.secrets.get(scope=secret_scope, key="LVT-DEX-SB-CONN-STR")
+schema = StructType([StructField("json_msg", StringType(), True)])
+
+# COMMAND ----------
+
+
+def read_messages_from_service_bus(CONNECTION_STR, QUEUE_NAME, batch_size):
+    """
+    Reads messages from an Azure Service Bus queue in batches.
+
+    This function establishes a connection to the Azure Service Bus queue,
+    retrieves messages in batches, decodes them from JSON, and marks them
+    as completed once processed. It stops fetching messages when no more
+    messages are available or when the batch size limit is reached.
+
+    Parameters:
+    - CONNECTION_STR (str): Connection string for the Azure Service Bus.
+    - QUEUE_NAME (str): Name of the Service Bus queue.
+    - batch_size (int): Maximum number of messages to retrieve.
+
+    Returns:
+    - list: A list containing the decoded messages.
+    """
+
+    try:
+        # Create a Service Bus client using the provided connection string
+        with ServiceBusClient.from_connection_string(CONNECTION_STR) as client:
+            # Get the queue receiver with a wait time and prefetch count for efficiency
+            with client.get_queue_receiver(
+                queue_name=QUEUE_NAME, max_wait_time=15, prefetch_count=1000
+            ) as receiver:
+                msg_list = []
+                i = 0
+                start_time = time.time()
+                nullCount = 0
+                while True:
+                    # Fetch messages in a batch from the queue
+                    messages = receiver.receive_messages(max_message_count=1000)
+                    print(f"got batch messages {len(messages)}")
+
+                    # Stop if no messages are left
+                    if not messages:
+                        if nullCount == 0:
+                            nullCount = 1
+                            continue
+                        else:
+                            break
+
+                    # Process each received message
+                    for message in messages:
+                        try:
+                            # Decode and parse the message body from JSON format
+                            msg = json.loads(b"".join(message.body).decode("utf-8"))
+                            msg_list.append(msg)
+                            # print(f"Received a message!")
+                        except json.JSONDecodeError:
+                            print(f"Invalid JSON: {message.body}")
+
+                        # Mark message as completed
+                        # print(f"complete!")
+                        receiver.complete_message(message)
+
+                    i = i + len(messages)
+                    # Stop processing if batch size limit is reached
+                    if i > batch_size:
+                        print(f"Reached {i} messages!")
+                        break
+
+                print(
+                    f"Completed reading {i} messages in {time.time() - start_time} seconds."
+                )
+                return msg_list
+    except Exception as e:
+        print(f"Error occurred: {e}")
+
+
+# COMMAND ----------
+
+"""
+Continuously read messages from the Azure Service Bus queue and process them.
+If no messages are found, the script waits for 60 seconds before retrying.
+"""
+while True:
+    # Read messages from the Service Bus
+    messages = read_messages_from_service_bus(connection_string, queue_name, batch_size)
+    print(messages)
+
+    # If no messages are received, wait for 60 seconds before retrying
+    # if len(messages) == 0 or messages is None:
+    #     print("No messages found. Pausing of 60 seconds...")
+    #     time.sleep(60)
+    #     continue
+
+    # Convert messages into tuples for DataFrame creation
+    data_tuples = [(message,) for message in messages]
+    print(data_tuples)
+    # Create a Spark DataFrame and add necessary columns
+    # messages_sdf = (
+    #     spark.createDataFrame(data_tuples, schema)
+    #     .withColumn("isProccessed", lit(0))
+    #     .withColumn("blobUrl", get_json_object(col("json_msg"), "$.data.blobUrl"))
+    #     .withColumn(
+    #         "dbfsUrl",
+    #         regexp_replace(
+    #             col("blobUrl"),
+    #             "https://prodrenewablesadlsgen2.blob.core.windows.net/nrt/",
+    #             "dbfs:/mnt/ot/",
+    #         ),
+    #     )
+    #     .withColumn("eventTime", get_json_object(col("json_msg"), "$.eventTime"))
+    #     .withColumn("insertedTimestampUtc", current_timestamp())
+    #     .withColumn("processedTimestampUtc", current_timestamp())
+    # )
+
+    # # Filter messages to include only those with specific blob storage URLs
+    # filtered_sdf = messages_sdf.filter(
+    #     col("blobUrl").contains(
+    #         "https://prodrenewablesadlsgen2.blob.core.windows.net/nrt/EDGE2CLOUD/DATA/ARCHIVAL/STANDARD"
+    #     )
+    # ).dropDuplicates(["blobUrl", "eventTime"])
+
+    # # Append the processed messages into a Delta table for storage
+    # filtered_sdf.write.format("delta").mode("append").saveAsTable(
+    #     f"{ucName}.{logSchemaName}.nrt_service_bus_messages"
+    # )
+
+    # # SQL query to remove duplicate records based on blobUrl and eventTime
+    # query = f"""
+    #     MERGE INTO {ucName}.{logSchemaName}.nrt_service_bus_messages AS target
+    #     USING (
+    #         SELECT blobUrl, eventTime FROM (
+    #             SELECT 
+    #                 blobUrl,
+    #                 eventTime, 
+    #                 ROW_NUMBER() OVER (PARTITION BY blobUrl, eventTime ORDER BY (insertedTimestampUtc)) AS rn
+    #             FROM {ucName}.{logSchemaName}.nrt_service_bus_messages
+    #         ) WHERE rn > 1 
+    #     ) AS source
+    #     ON target.blobUrl = source.blobUrl AND target.eventTime = source.eventTime
+    #     WHEN MATCHED THEN DELETE;
+    #     """
+
+    # # Execute the merge query to remove duplicate
+    # spark.sql(query)
+# Databricks notebook source
+# MAGIC %pip install azure-servicebus
+
+# COMMAND ----------
+
+# MAGIC %restart_python
+
+# COMMAND ----------
+
+from azure.servicebus import ServiceBusClient, ServiceBusMessage
+import json
+from pyspark.sql.types import StructType, StructField, StringType
+from pyspark.sql.functions import (
+    lit,
+    current_timestamp,
+    col,
+    get_json_object,
+    regexp_replace,
+    split,
+    sha2,
+    lit,
+    concat_ws,
+    current_timestamp,
+    col,
+    when,
+    size,
+)
+import time
+from delta.tables import *
+
+# COMMAND ----------
+
+dbutils.widgets.text("secret_scope", "orlkvtst")
+dbutils.widgets.text("queue_name", "lvt-dex-intergration-tst-exportpotential")
+dbutils.widgets.text("ucName", "res_team_orl_uc_tst")
+dbutils.widgets.text("logSchemaName", "logging_info")
+dbutils.widgets.text("batchSize", "100000")
+
+# COMMAND ----------
+
+secret_scope = dbutils.widgets.get("secret_scope")
+queue_name = dbutils.widgets.get("queue_name")
+ucName = dbutils.widgets.get("ucName")
+logSchemaName = dbutils.widgets.get("logSchemaName")
+batch_size = int(dbutils.widgets.get("batchSize"))
+
+# COMMAND ----------
+
+connection_string = dbutils.secrets.get(scope=secret_scope, key="LVT-DEX-SB-CONN-STR")
+schema = StructType([StructField("json_msg", StringType(), True)])
+
+# COMMAND ----------
+
+
+def read_messages_from_service_bus(CONNECTION_STR, QUEUE_NAME, batch_size):
+    """
+    Reads messages from an Azure Service Bus queue in batches.
+
+    This function establishes a connection to the Azure Service Bus queue,
+    retrieves messages in batches, decodes them from JSON, and marks them
+    as completed once processed. It stops fetching messages when no more
+    messages are available or when the batch size limit is reached.
+
+    Parameters:
+    - CONNECTION_STR (str): Connection string for the Azure Service Bus.
+    - QUEUE_NAME (str): Name of the Service Bus queue.
+    - batch_size (int): Maximum number of messages to retrieve.
+
+    Returns:
+    - list: A list containing the decoded messages.
+    """
+
+    try:
+        # Create a Service Bus client using the provided connection string
+        with ServiceBusClient.from_connection_string(CONNECTION_STR) as client:
+            # Get the queue receiver with a wait time and prefetch count for efficiency
+            with client.get_queue_receiver(
+                queue_name=QUEUE_NAME, max_wait_time=15, prefetch_count=1000
+            ) as receiver:
+                msg_list = []
+                i = 0
+                start_time = time.time()
+                nullCount = 0
+                while True:
+                    # Fetch messages in a batch from the queue
+                    messages = receiver.receive_messages(max_message_count=1000)
+                    print(f"got batch messages {len(messages)}")
+
+                    # Stop if no messages are left
+                    if not messages:
+                        if nullCount == 0:
+                            nullCount = 1
+                            continue
+                        else:
+                            break
+
+                    # Process each received message
+                    for message in messages:
+                        try:
+                            # Decode and parse the message body from JSON format
+                            msg = json.loads(b"".join(message.body).decode("utf-8"))
+                            msg_list.append(msg)
+                            # print(f"Received a message!")
+                        except json.JSONDecodeError:
+                            print(f"Invalid JSON: {message.body}")
+
+                        # Mark message as completed
+                        # print(f"complete!")
+                        receiver.complete_message(message)
+
+                    i = i + len(messages)
+                    # Stop processing if batch size limit is reached
+                    if i > batch_size:
+                        print(f"Reached {i} messages!")
+                        break
+
+                print(
+                    f"Completed reading {i} messages in {time.time() - start_time} seconds."
+                )
+                return msg_list
+    except Exception as e:
+        print(f"Error occurred: {e}")
+
+
+# COMMAND ----------
+
+"""
+Continuously read messages from the Azure Service Bus queue and process them.
+If no messages are found, the script waits for 60 seconds before retrying.
+"""
+while True:
+    # Read messages from the Service Bus
+    messages = read_messages_from_service_bus(connection_string, queue_name, batch_size)
+    print(messages)
+
+    # If no messages are received, wait for 60 seconds before retrying
+    # if len(messages) == 0 or messages is None:
+    #     print("No messages found. Pausing of 60 seconds...")
+    #     time.sleep(60)
+    #     continue
+
+    # Convert messages into tuples for DataFrame creation
+    data_tuples = [(message,) for message in messages]
+    print(data_tuples)
+    # Create a Spark DataFrame and add necessary columns
+    # messages_sdf = (
+    #     spark.createDataFrame(data_tuples, schema)
+    #     .withColumn("isProccessed", lit(0))
+    #     .withColumn("blobUrl", get_json_object(col("json_msg"), "$.data.blobUrl"))
+    #     .withColumn(
+    #         "dbfsUrl",
+    #         regexp_replace(
+    #             col("blobUrl"),
+    #             "https://prodrenewablesadlsgen2.blob.core.windows.net/nrt/",
+    #             "dbfs:/mnt/ot/",
+    #         ),
+    #     )
+    #     .withColumn("eventTime", get_json_object(col("json_msg"), "$.eventTime"))
+    #     .withColumn("insertedTimestampUtc", current_timestamp())
+    #     .withColumn("processedTimestampUtc", current_timestamp())
+    # )
+
+    # # Filter messages to include only those with specific blob storage URLs
+    # filtered_sdf = messages_sdf.filter(
+    #     col("blobUrl").contains(
+    #         "https://prodrenewablesadlsgen2.blob.core.windows.net/nrt/EDGE2CLOUD/DATA/ARCHIVAL/STANDARD"
+    #     )
+    # ).dropDuplicates(["blobUrl", "eventTime"])
+
+    # # Append the processed messages into a Delta table for storage
+    # filtered_sdf.write.format("delta").mode("append").saveAsTable(
+    #     f"{ucName}.{logSchemaName}.nrt_service_bus_messages"
+    # )
+
+    # # SQL query to remove duplicate records based on blobUrl and eventTime
+    # query = f"""
+    #     MERGE INTO {ucName}.{logSchemaName}.nrt_service_bus_messages AS target
+    #     USING (
+    #         SELECT blobUrl, eventTime FROM (
+    #             SELECT 
+    #                 blobUrl,
+    #                 eventTime, 
+    #                 ROW_NUMBER() OVER (PARTITION BY blobUrl, eventTime ORDER BY (insertedTimestampUtc)) AS rn
+    #             FROM {ucName}.{logSchemaName}.nrt_service_bus_messages
+    #         ) WHERE rn > 1 
+    #     ) AS source
+    #     ON target.blobUrl = source.blobUrl AND target.eventTime = source.eventTime
+    #     WHEN MATCHED THEN DELETE;
+    #     """
+
+    # # Execute the merge query to remove duplicate
+    # spark.sql(query)
