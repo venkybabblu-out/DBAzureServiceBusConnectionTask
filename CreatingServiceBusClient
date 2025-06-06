@@ -1,0 +1,16 @@
+from azure.servicebus import ServiceBusClient, ServiceBusMessage
+
+connection_string = dbutils.secrets.get(scope=secret_scope, key="LVT-DEX-SB-CONN-STR")
+# Replace with your values
+TOPIC_NAME = "lvt-dex-intergration-tst-exportpotential"
+
+# Create a ServiceBusClient
+with ServiceBusClient.from_connection_string(conn_str=connection_string) as client:
+    # Get a sender for the topic
+    with client.get_topic_sender(topic_name=TOPIC_NAME) as sender:
+        # Create a message
+        message = ServiceBusMessage("Hello, this is a test message!")
+
+        # Send the message
+        sender.send_messages(message)
+        print("Message sent to topic.")
